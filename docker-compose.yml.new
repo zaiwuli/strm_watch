@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  strm_watch:
+    build: .
+    image: strm_watch:latest
+    container_name: strm_watch
+    
+    # 群晖 Docker 兼容配置
+    restart: unless-stopped
+    
+    # 数据卷挂载 - 根据实际情况修改
+    volumes:
+      - /volume1/source:/source           # 源文件夹 - 修改为实际路径
+      - /volume1/target:/target           # 目标文件夹 - 修改为实际路径
+      - /volume1/@appstore/strm_watch/logs:/app  # 日志卷 - 可选
+    
+    # 环境变量配置
+    environment:
+      # 文件路径
+      SOURCE_DIR: /source
+      TARGET_DIR: /target
+      
+      # 替换配置
+      OLD_KEYWORD: /CloudNAS/CloudDrive/115open/
+      NEW_MOUNT_PREFIX: /115/
+      
+      # MediaServer 通知配置（可选）
+      # MS_URL: http://192.168.1.100:7001
+      # MS_API_KEY: your_api_key_here
+      
+      # URL 编码开关
+      ENABLE_URL_ENCODE: "True"
+      
+      # 时区设置
+      TZ: Asia/Shanghai
+    
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # 资源限制（群晖 NAS 较弱的配置）
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+        reservations:
+          cpus: '0.25'
+          memory: 64M
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "test", "-f", "/app/strm_watch.log"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
