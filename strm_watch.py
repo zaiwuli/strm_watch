@@ -1,218 +1,165 @@
 import os
-import sys
 import time
 import json
 import http.client
 import logging
 from datetime import datetime
 from urllib.parse import urlparse, quote
+from threading import Thread
+import streamlit as st
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# ================= 日志配置 =================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/app/strm_watch.log', encoding='utf-8')
-    ]
-)
-logger = logging.getLogger(__name__)
+# ================= 页面与日志配置 =================
+st.set_page_config(page_title="STRM Watch 控制台", page_icon="🚀", layout="wide")
 
-# ================= 配置区域 =================
-SOURCE_DIR = os.getenv("SOURCE_DIR", "/source")
-TARGET_DIR = os.getenv("TARGET_DIR", "/target")
-OLD_KEYWORD = os.getenv("OLD_KEYWORD", "/CloudNAS/CloudDrive/115open/")
-NEW_MOUNT_PREFIX = os.getenv("NEW_MOUNT_PREFIX", "/115/")
-MS_URL = os.getenv("MS_URL", "")
-MS_API_KEY = os.getenv("MS_API_KEY", "")
-ENABLE_URL_ENCODE = os.getenv("ENABLE_URL_ENCODE", "True").lower() == "true"
-STR_API_PATH = "api/v1/cloudStorage/strm302"
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 2
-# ===========================================
+if 'logs' not in st.session_state:
+    st.session_state.logs = []
+if 'obs_started' not in st.session_state:
+    st.session_state.obs_started = False
 
-def validate_config():
-    """验证必要的配置"""
-    if not os.path.isdir(SOURCE_DIR):
-        logger.error(f"源文件夹不存在或无权限访问: {SOURCE_DIR}")
-        return False
-    if not os.path.isdir(TARGET_DIR):
-        try:
-            os.makedirs(TARGET_DIR, exist_ok=True)
-            logger.info(f"已创建目标文件夹: {TARGET_DIR}")
-        except Exception as e:
-            logger.error(f"无法创建目标文件夹 {TARGET_DIR}: {e}")
-            return False
-    logger.info(f"配置验证成功 - 源: {SOURCE_DIR}, 目标: {TARGET_DIR}")
-    return True
+# ================= UI 侧边栏：参数配置 =================
+with st.sidebar:
+    st.header("⚙️ 参数配置")
+    
+    # 基础配置 (从环境变量获取初始值)
+    ms_url = st.text_input("Media Saber 地址", value=os.getenv("MS_URL", "https://"))
+    ms_key = st.text_input("Media Saber API Key", value=os.getenv("MS_API_KEY", ""), type="password")
+    
+    st.divider()
+    
+    old_kw = st.text_input("旧路径关键字", value=os.getenv("OLD_KEYWORD", ""))
+    new_prefix = st.text_input("新路径前缀", value=os.getenv("NEW_MOUNT_PREFIX", "/"))
+    
+    encode_on = st.toggle("路径 UrlEncode 编码", value=True)
+    
+    st.divider()
+    
+    # 物理映射路径 (只读显示)
+    st.caption("📂 物理映射路径 (只读)")
+    src_dir = os.getenv("SOURCE_DIR", "/源文件夹")
+    tgt_dir = os.getenv("TARGET_DIR", "/目标文件夹")
+    st.text(f"源: {src_dir}")
+    st.text(f"目: {tgt_dir}")
+
+# ================= 逻辑处理函数 =================
 
 def send_ms_notification(title, content):
-    """发送 MediaServer 通知"""
-    if not MS_URL or not MS_API_KEY:
-        logger.debug("通知功能未启用 (MS_URL 或 MS_API_KEY 为空)")
-        return
+    """发送 MS 通知 (带重试逻辑)"""
+    if not ms_url.startswith("http") or not ms_key: return
     
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
+    # 尝试 3 次发送
+    for attempt in range(3):
         try:
-            url = f"{MS_URL.rstrip('/')}/api/v1/message/openSend"
+            url = f"{ms_url.rstrip('/')}/api/v1/message/openSend"
             p = urlparse(url)
             payload = json.dumps({"title": title, "content": content})
-            headers = {'Content-Type': 'application/json', 'apiKey': MS_API_KEY}
-            
-            conn = (http.client.HTTPSConnection(p.netloc, timeout=10) if p.scheme == 'https' 
-                    else http.client.HTTPConnection(p.netloc, timeout=10))
+            headers = {'Content-Type': 'application/json', 'apiKey': ms_key}
+            conn = (http.client.HTTPSConnection(p.netloc, timeout=5) if p.scheme == 'https' 
+                    else http.client.HTTPConnection(p.netloc, timeout=5))
             conn.request("POST", p.path, body=payload, headers=headers)
-            resp = conn.getresponse()
-            resp.read()
-            conn.close()
-            logger.info(f"通知已发送: {title}")
-            return
-        except Exception as e:
-            logger.warning(f"通知发送失败 (尝试 {attempt}/{RETRY_ATTEMPTS}): {e}")
-            if attempt < RETRY_ATTEMPTS:
-                time.sleep(RETRY_DELAY)
-            else:
-                logger.error(f"通知最终失败: {title}")
+            conn.getresponse(); conn.close()
+            return # 发送成功
+        except:
+            time.sleep(2)
 
 def process_file(src_path):
-    """处理单个 .strm 文件"""
-    if not src_path.endswith(".strm"):
-        return False
-    
-    file_name = os.path.basename(src_path)
-    
+    """核心替换逻辑"""
+    if not src_path.endswith(".strm"): return False
     try:
-        # 检查文件是否可读
-        if not os.access(src_path, os.R_OK):
-            logger.warning(f"无权限读取文件: {src_path}")
-            return False
+        rel_path = os.path.relpath(src_path, src_dir)
+        target_path = os.path.join(tgt_dir, rel_path)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
         
-        # 计算相对路径
-        rel_path = os.path.relpath(src_path, SOURCE_DIR)
-        target_path = os.path.join(TARGET_DIR, rel_path)
-        
-        # 创建目标目录
-        target_dir = os.path.dirname(target_path)
-        os.makedirs(target_dir, exist_ok=True)
-        
-        # 读取源文件内容
         with open(src_path, 'r', encoding='utf-8') as f:
             content = f.read().strip()
-        
-        # 验证内容
-        if not content:
-            logger.warning(f"文件内容为空: {src_path}")
-            return False
-        
-        # 检查是否包含待替换的关键词
-        if OLD_KEYWORD not in content:
-            logger.debug(f"文件不包含待替换关键词 '{OLD_KEYWORD}': {file_name}")
-            return False
-        
-        # 提取路径部分
-        path_part = content.split(OLD_KEYWORD)[-1].lstrip('/')
-        
-        # 构建新路径
-        final_path = (NEW_MOUNT_PREFIX.rstrip('/') + '/' + path_part).replace('\\', '/')
-        
-        # URL 编码
-        if ENABLE_URL_ENCODE:
-            final_path = quote(final_path, safe='/')
-        
-        # 生成新内容
-        new_content = f"{MS_URL.rstrip('/')}/{STR_API_PATH}?apiKey={MS_API_KEY}&pickCode=&path={final_path}"
-        
-        # 写入目标文件
-        with open(target_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        
-        logger.info(f"✓ 成功处理: {file_name}")
-        return True
-        
-    except PermissionError as e:
-        logger.error(f"权限错误 - {file_name}: {e}")
-        return False
-    except IOError as e:
-        logger.error(f"I/O 错误 - {file_name}: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"未知错误处理 {file_name}: {e}", exc_info=True)
-        return False
+            
+        if old_kw and old_kw in content:
+            path_part = content.split(old_kw)[-1].lstrip('/')
+            final_path = (new_prefix.rstrip('/') + '/' + path_part).replace('\\', '/')
+            if encode_on: final_path = quote(final_path, safe='/')
+            
+            new_c = f"{ms_url.rstrip('/')}/api/v1/cloudStorage/strm302?apiKey={ms_key}&pickCode=&path={final_path}"
+            
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(new_c)
+            return True
+    except: pass
+    return False
+
+def manual_replace_tool(raw_text):
+    """手动转换工具逻辑"""
+    if not raw_text: return None
+    if old_kw and old_kw in raw_text:
+        path_part = raw_text.split(old_kw)[-1].lstrip('/')
+        final_path = (new_prefix.rstrip('/') + '/' + path_part).replace('\\', '/')
+        if encode_on: final_path = quote(final_path, safe='/')
+        return f"{ms_url.rstrip('/')}/api/v1/cloudStorage/strm302?apiKey={ms_key}&pickCode=&path={final_path}"
+    return "⚠️ 未匹配到关键字"
+
+# ================= 主界面 UI =================
+
+st.title("🚀 STRM Watch 自动化哨兵")
+
+# 1. 状态卡片
+col1, col2, col3 = st.columns(3)
+col1.metric("待处理源目录", os.path.basename(src_dir))
+col2.metric("已处理目标目录", os.path.basename(tgt_dir))
+col3.metric("通知状态", "✅ 已就绪" if ms_key else "❌ 未配置")
+
+# 2. 手动工具箱 (Expander)
+with st.expander("🛠️ 手动路径转换工具"):
+    st.caption("粘贴 strm 文件内的原始内容，快速生成修复后的 API 链接")
+    test_input = st.text_input("原始路径内容", placeholder="例如: /CloudNAS/CloudDrive/115open/电影.mkv")
+    if test_input:
+        res = manual_replace_tool(test_input)
+        if "http" in str(res):
+            st.success("转换成功！")
+            st.code(res, language="text")
+        else:
+            st.warning(res)
+
+# 3. 日志与操作区
+st.divider()
+st.subheader("📋 实时同步日志")
+log_box = st.empty()
+
+def update_log(msg):
+    t = time.strftime("%H:%M:%S", time.localtime())
+    st.session_state.logs.insert(0, f"[{t}] {msg}")
+    if len(st.session_state.logs) > 50: st.session_state.logs.pop()
+    log_box.code("\n".join(st.session_state.logs))
+
+if st.button("🔄 执行全量扫描"):
+    if not old_kw or not ms_key:
+        st.error("请先完成参数配置")
+    else:
+        count = 0
+        with st.spinner("处理中..."):
+            for root, _, files in os.walk(src_dir):
+                for f in files:
+                    if process_file(os.path.join(root, f)): count += 1
+        update_log(f"📊 全量扫描完成，同步文件: {count}")
+        if count > 0: send_ms_notification("📊 同步报告", f"初始扫描已处理 {count} 个文件")
+
+# ================= 后台监控线程 =================
 
 class WatcherHandler(FileSystemEventHandler):
-    """文件系统事件处理器"""
-    
     def on_created(self, event):
-        if event.is_directory:
-            return
-        try:
-            if process_file(event.src_path):
-                send_ms_notification("🆕 实时同步通知", f"入库：{os.path.basename(event.src_path)}")
-        except Exception as e:
-            logger.error(f"on_created 处理异常: {e}", exc_info=True)
-    
+        if not event.is_directory and process_file(event.src_path):
+            update_log(f"🆕 入库: {os.path.basename(event.src_path)}")
+            send_ms_notification("🆕 实时同步通知", f"入库：{os.path.basename(event.src_path)}")
     def on_modified(self, event):
-        if event.is_directory:
-            return
-        try:
-            if process_file(event.src_path):
-                send_ms_notification("🔄 内容更正通知", f"更正：{os.path.basename(event.src_path)}")
-        except Exception as e:
-            logger.error(f"on_modified 处理异常: {e}", exc_info=True)
+        if not event.is_directory and process_file(event.src_path):
+            update_log(f"🔄 更正: {os.path.basename(event.src_path)}")
+            send_ms_notification("🔄 内容更正通知", f"更正：{os.path.basename(event.src_path)}")
 
-if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("STRM Watch 监控服务启动")
-    logger.info(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
-    
-    # 验证配置
-    if not validate_config():
-        logger.critical("配置验证失败，服务退出")
-        sys.exit(1)
-    
-    # 初始扫描
-    logger.info("开始初始扫描源文件夹...")
-    initial_count = 0
-    error_count = 0
-    
-    try:
-        for root, _, files in os.walk(SOURCE_DIR):
-            for f in files:
-                src_file = os.path.join(root, f)
-                try:
-                    if process_file(src_file):
-                        initial_count += 1
-                except Exception as e:
-                    logger.error(f"初始扫描处理失败 {src_file}: {e}")
-                    error_count += 1
-    except Exception as e:
-        logger.error(f"初始扫描异常: {e}", exc_info=True)
-    
-    logger.info(f"初始扫描完成 - 成功: {initial_count}, 失败: {error_count}")
-    
-    if initial_count > 0:
-        send_ms_notification("📊 启动同步报告", f"初始扫描已处理 {initial_count} 个文件")
-    
-    # 启动监控
-    logger.info("启动文件系统监控...")
-    event_handler = WatcherHandler()
+if not st.session_state.obs_started:
     observer = Observer()
-    observer.schedule(event_handler, SOURCE_DIR, recursive=True)
+    observer.schedule(WatcherHandler(), src_dir, recursive=True)
     observer.start()
-    
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("收到中断信号，正在关闭...")
-        observer.stop()
-    except Exception as e:
-        logger.error(f"监控异常: {e}", exc_info=True)
-        observer.stop()
-    finally:
-        observer.join()
-        logger.info("监控服务已停止")
-        logger.info("=" * 60)
+    st.session_state.obs_started = True
+    update_log("🚀 哨兵系统已上线，实时监听中...")
+
+# 实时显示历史日志
+log_box.code("\n".join(st.session_state.logs))
