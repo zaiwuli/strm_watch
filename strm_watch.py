@@ -83,6 +83,10 @@ class AppStatus:
     lock = Lock()
     recent_events: Dict[str, float] = {}
     debounce_seconds = 1.0
+    incremental_converted: list[str] = []
+    incremental_deleted: list[str] = []
+    incremental_notify_timer: Optional[Thread] = None
+    incremental_notify_delay = 30
 
 
 def setup_logging():
@@ -250,6 +254,65 @@ def send_ms_notification(title: str, content: str, force: bool = False):
     Thread(target=_do_send_ms, args=(title, content), daemon=True).start()
 
 
+def target_path_for_source(src_path: Path) -> Path:
+    rel_path = src_path.relative_to(Path(config.src).resolve())
+    return Path(config.tgt).resolve() / rel_path
+
+
+def build_incremental_notification_content(converted: list[str], deleted: list[str]) -> str:
+    lines = [
+        "STRM 增量处理完成",
+        f"转换/更新：{len(converted)}",
+        f"删除同步：{len(deleted)}",
+    ]
+    if converted:
+        lines.append("")
+        lines.append("转换/更新文件：")
+        lines.extend(f"- {name}" for name in converted[:10])
+        if len(converted) > 10:
+            lines.append(f"- 其余 {len(converted) - 10} 个文件省略")
+    if deleted:
+        lines.append("")
+        lines.append("删除同步文件：")
+        lines.extend(f"- {name}" for name in deleted[:10])
+        if len(deleted) > 10:
+            lines.append(f"- 其余 {len(deleted) - 10} 个文件省略")
+    return "\n".join(lines)
+
+
+def flush_incremental_notification():
+    with AppStatus.lock:
+        converted = AppStatus.incremental_converted[:]
+        deleted = AppStatus.incremental_deleted[:]
+        AppStatus.incremental_converted.clear()
+        AppStatus.incremental_deleted.clear()
+        AppStatus.incremental_notify_timer = None
+
+    if not converted and not deleted:
+        return
+
+    content = build_incremental_notification_content(converted, deleted)
+    logger.info("发送增量汇总通知：转换/更新=%s，删除=%s", len(converted), len(deleted))
+    send_ms_notification("STRM 增量处理通知", content)
+
+
+def delayed_incremental_notification():
+    time.sleep(AppStatus.incremental_notify_delay)
+    flush_incremental_notification()
+
+
+def record_incremental_change(action: str, src_path: Path):
+    with AppStatus.lock:
+        if action == "deleted":
+            AppStatus.incremental_deleted.append(src_path.name)
+        else:
+            AppStatus.incremental_converted.append(src_path.name)
+        if AppStatus.incremental_notify_timer is None or not AppStatus.incremental_notify_timer.is_alive():
+            AppStatus.incremental_notify_timer = Thread(target=delayed_incremental_notification, daemon=True)
+            AppStatus.incremental_notify_timer.start()
+            logger.info("增量汇总通知计时开始：%s 秒后发送", AppStatus.incremental_notify_delay)
+
+
 def process_file_logic(src_path: Path) -> bool:
     if src_path.suffix.lower() != ".strm" or not config.old_kw:
         return False
@@ -259,8 +322,7 @@ def process_file_logic(src_path: Path) -> bool:
 
     try:
         logger.info("开始处理：%s", src_path)
-        rel_path = src_path.relative_to(Path(config.src).resolve())
-        target_path = Path(config.tgt).resolve() / rel_path
+        target_path = target_path_for_source(src_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(src_path, "r", encoding="utf-8") as f:
@@ -289,6 +351,22 @@ def process_file_logic(src_path: Path) -> bool:
         return True
     except Exception as e:
         logger.error("处理失败 %s：%s", src_path.name, e)
+        return False
+
+
+def delete_target_for_source(src_path: Path) -> bool:
+    if src_path.suffix.lower() != ".strm":
+        return False
+    try:
+        target_path = target_path_for_source(src_path)
+        if target_path.exists():
+            target_path.unlink()
+            logger.info("删除同步完成：%s -> %s", src_path.name, target_path)
+            return True
+        logger.info("删除同步跳过：目标文件不存在 %s", target_path)
+        return False
+    except Exception as e:
+        logger.error("删除同步失败 %s：%s", src_path.name, e)
         return False
 
 
@@ -369,6 +447,7 @@ def stop_runtime():
 
     with AppStatus.lock:
         logger.info("当前任务已停止")
+    flush_incremental_notification()
 
 
 def start_watchdog_incremental():
@@ -403,10 +482,10 @@ def file_signature(path: Path) -> tuple[float, int]:
 
 def poll_loop(interval: int):
     logger.info("轮询线程已启动：间隔=%s 秒", interval)
-    seen: Dict[str, tuple[float, int]] = {}
+    seen: Dict[str, tuple[tuple[float, int], Path]] = {}
     for path in strm_generator():
         try:
-            seen[str(path.resolve())] = file_signature(path)
+            seen[str(path.resolve())] = (file_signature(path), path.resolve())
         except OSError:
             continue
     logger.info("轮询初始快照完成：已记录 %s 个 STRM 文件", len(seen))
@@ -415,6 +494,7 @@ def poll_loop(interval: int):
         logger.info("轮询检查开始")
         current_keys = set()
         changed = 0
+        deleted = 0
         for path in strm_generator():
             try:
                 key = str(path.resolve())
@@ -422,13 +502,18 @@ def poll_loop(interval: int):
             except OSError:
                 continue
             current_keys.add(key)
-            if seen.get(key) != signature:
-                seen[key] = signature
+            old_entry = seen.get(key)
+            if old_entry is None or old_entry[0] != signature:
+                seen[key] = (signature, path.resolve())
                 changed += 1
-                process_file_logic(path)
-        for missing_key in set(seen) - current_keys:
-            seen.pop(missing_key, None)
-        logger.info("轮询检查完成：发现新增或修改 %s 个", changed)
+                if process_file_logic(path):
+                    record_incremental_change("converted", path)
+        for missing_key in list(set(seen) - current_keys):
+            missing_path = seen.pop(missing_key)[1]
+            if delete_target_for_source(missing_path):
+                deleted += 1
+                record_incremental_change("deleted", missing_path)
+        logger.info("轮询检查完成：新增/修改 %s 个，删除 %s 个", changed, deleted)
     logger.info("轮询线程已退出")
 
 
@@ -467,13 +552,24 @@ class WatchHandler(FileSystemEventHandler):
             }
 
         logger.info("监听事件：%s %s", action, os.path.basename(event.src_path))
-        process_file_logic(src_path)
+        if process_file_logic(src_path):
+            record_incremental_change("converted", src_path)
 
     def on_created(self, event):
         self._handle(event, "新增")
 
     def on_modified(self, event):
         self._handle(event, "修改")
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        src_path = Path(event.src_path)
+        if src_path.suffix.lower() != ".strm":
+            return
+        logger.info("监听事件：删除 %s", os.path.basename(event.src_path))
+        if delete_target_for_source(src_path):
+            record_incremental_change("deleted", src_path)
 
 
 @ui.page("/")
