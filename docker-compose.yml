@@ -1,7 +1,6 @@
-version: '3.8'
 services:
   strm_watch:
-    image: ghcr.io/YOUR_USERNAME/strm_watch:latest
+    image: ghcr.io/zaiwuli/strm_watch:latest
     container_name: strm_watch
     restart: always
     ports:
