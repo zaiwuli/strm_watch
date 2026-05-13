@@ -1,13 +1,13 @@
 FROM python:3.9-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    SOURCE_DIR=/source \
-    TARGET_DIR=/target \
+    SOURCE_DIR=/源文件夹 \
+    TARGET_DIR=/目标文件夹 \
     CONFIG_PATH=/config/settings.json
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && mkdir -p /source /target /config
+RUN pip install --no-cache-dir -r requirements.txt && mkdir -p /源文件夹 /目标文件夹 /config
 
 COPY strm_watch.py .
 EXPOSE 8501

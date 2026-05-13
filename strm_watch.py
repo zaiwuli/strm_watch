@@ -19,8 +19,8 @@ CONFIG_FILE = Path(os.getenv("CONFIG_PATH", "/config/settings.json"))
 
 class GlobalConfig:
     def __init__(self):
-        self.src = os.getenv("SOURCE_DIR", "/source")
-        self.tgt = os.getenv("TARGET_DIR", "/target")
+        self.src = os.getenv("SOURCE_DIR", "/源文件夹")
+        self.tgt = os.getenv("TARGET_DIR", "/目标文件夹")
         self.old_kw = ""
         self.new_pre = "/"
         self.ms_url = ""
