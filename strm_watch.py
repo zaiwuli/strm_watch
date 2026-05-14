@@ -32,6 +32,8 @@ class GlobalConfig:
         self.url_enc = True
         self.notify = True
         self.poll_interval = 60
+        self.last_run_mode = "增量"
+        self.last_monitor_mode = "监控"
         self.load()
 
     def load(self):
@@ -48,6 +50,8 @@ class GlobalConfig:
             self.url_enc = data.get("url_enc", self.url_enc)
             self.notify = data.get("notify", self.notify)
             self.poll_interval = int(data.get("poll_interval", self.poll_interval))
+            self.last_run_mode = data.get("last_run_mode", self.last_run_mode)
+            self.last_monitor_mode = data.get("last_monitor_mode", self.last_monitor_mode)
         except Exception as e:
             print(f"Failed to load config: {e}")
 
@@ -62,6 +66,8 @@ class GlobalConfig:
                 "url_enc": self.url_enc,
                 "notify": self.notify,
                 "poll_interval": self.poll_interval,
+                "last_run_mode": self.last_run_mode,
+                "last_monitor_mode": self.last_monitor_mode,
             }
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
@@ -616,9 +622,9 @@ def main_page():
     ui.query("body").style("background-color: #f8fafc")
     example_new = {"value": ""}
     example_old = {"value": ""}
-    run_options = {"mode": "增量", "monitor": "监控"}
+    run_options = {"mode": config.last_run_mode, "monitor": config.last_monitor_mode}
     with ui.header().classes("items-center justify-between bg-slate-900 text-white shadow-md"):
-        ui.label("📡 STRM 监控转换工具").classes("text-xl font-bold ml-4")
+        ui.label("📡 StrmWatch").classes("text-xl font-bold ml-4")
         with ui.row().classes("items-center mr-4 gap-3"):
             ui.label("🟢 运行中" if AppStatus.is_running else "🔴 未启动").classes("text-base font-bold").props(
                 'id="status-label"'
@@ -627,24 +633,118 @@ def main_page():
 
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
         with ui.card().classes("w-full p-5 shadow-sm border-none bg-white"):
-            ui.label("🧭 启动控制").classes("text-lg font-bold text-slate-700 mb-3")
+            ui.label("⚙️ 配置").classes("text-lg font-bold text-slate-700 mb-4")
+
+            with ui.row().classes("w-full gap-4 mb-4"):
+                ui.input("源目录（Docker 挂载）").bind_value(config, "src").classes("flex-1").props("disable")
+                ui.input("目标目录（Docker 挂载）").bind_value(config, "tgt").classes("flex-1").props("disable")
+
+            with ui.expansion("小工具", icon="auto_awesome").classes("w-full mb-4"):
+                ui.input("新 STRM 示例链接").bind_value(example_new, "value").classes("w-full mb-3")
+                ui.input("旧 STRM 原始路径").bind_value(example_old, "value").classes("w-full mb-3")
+
+                def handle_infer_config():
+                    try:
+                        logger.info("用户点击识别并填充")
+                        logger.info("开始识别示例 STRM 配置")
+                        inferred = infer_config_from_examples(example_new["value"], example_old["value"])
+                        config.ms_url = inferred["ms_url"]
+                        config.ms_key = inferred["ms_key"]
+                        config.old_kw = inferred["old_kw"]
+                        config.new_pre = inferred["new_pre"]
+                        ui.notify(f"已识别并填充配置：{inferred['mode']}", type="positive")
+                        logger.info(
+                            "已识别配置：模式=%s，服务=%s，API Key=%s，旧路径关键字=%s，新路径前缀=%s",
+                            inferred["mode"],
+                            inferred["ms_url"],
+                            mask_secret(inferred["ms_key"]),
+                            inferred["old_kw"],
+                            inferred["new_pre"],
+                        )
+                    except ValueError as e:
+                        logger.warning("识别失败：%s", e)
+                        ui.notify(str(e), type="warning")
+                    finally:
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
+
+                ui.button("✨ 识别并填充", on_click=handle_infer_config).classes("bg-cyan-600 text-white").props(
+                    "unelevated"
+                )
+
+            with ui.row().classes("w-full gap-4 mb-4"):
+                ui.input("旧路径关键字", validation={"不能为空": lambda v: len(v) > 0}).bind_value(
+                    config, "old_kw"
+                ).classes("flex-1")
+                ui.input("新路径前缀", validation={"不能为空": lambda v: len(v) > 0}).bind_value(
+                    config, "new_pre"
+                ).classes("flex-1")
+
+            with ui.row().classes("w-full gap-4 mb-4"):
+                ui.input("媒体服务地址").bind_value(config, "ms_url").classes("flex-1")
+                ui.input("API Key", password=True).bind_value(config, "ms_key").classes("flex-1")
+
+            with ui.row().classes("w-full gap-6 items-center"):
+                ui.checkbox("URL 编码").bind_value(config, "url_enc")
+                ui.checkbox("启用通知").bind_value(config, "notify")
+                ui.space()
+
+                def handle_save():
+                    try:
+                        logger.info("用户点击保存配置")
+                        config.last_run_mode = run_options["mode"]
+                        config.last_monitor_mode = run_options["monitor"]
+                        if config.save():
+                            ui.notify("配置已保存", type="positive")
+                            logger.info("配置已保存：%s", CONFIG_FILE)
+                        else:
+                            logger.error("保存配置失败")
+                            ui.notify("保存失败，请检查配置目录权限", type="negative")
+                    finally:
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
+
+                def handle_test_notification():
+                    try:
+                        logger.info("用户点击测试通知")
+                        logger.info("开始测试通知")
+                        if not config.ms_url or not config.ms_key:
+                            logger.warning("测试通知失败：媒体服务地址或 API Key 为空")
+                            ui.notify("请先填写媒体服务地址和 API Key", type="warning")
+                            return
+                        if not is_valid_ms_url(config.ms_url):
+                            logger.warning("测试通知失败：媒体服务地址格式不正确")
+                            ui.notify("媒体服务地址必须以 http:// 或 https:// 开头", type="warning")
+                            return
+                        send_ms_notification("测试通知", "连接正常", True)
+                        ui.notify("测试通知已发送到队列", type="info")
+                    finally:
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
+
+                ui.button("🧪 测试通知", on_click=handle_test_notification).classes("bg-amber-500").props(
+                    "unelevated outline"
+                )
+                ui.button("💾 保存配置", on_click=handle_save).classes("bg-green-600 text-white").props("unelevated")
+
+        with ui.card().classes("w-full p-5 shadow-sm border-none bg-white"):
+            ui.label("🧭 运行控制").classes("text-lg font-bold text-slate-700 mb-3")
             with ui.row().classes("w-full gap-3 items-end"):
                 with ui.column().classes("gap-1"):
                     ui.label("执行模式").classes("text-xs text-slate-500")
-                    ui.toggle(["全量", "增量"], value="增量").bind_value(run_options, "mode").classes("w-56").props(
-                        "unelevated spread"
-                    )
+                    ui.toggle(["全量", "增量"], value=config.last_run_mode).bind_value(run_options, "mode").classes(
+                        "w-56"
+                    ).props("unelevated spread")
                 with ui.column().classes("gap-1"):
                     ui.label("增量方式").classes("text-xs text-slate-500")
-                    ui.toggle(["监控", "轮询"], value="监控").bind_value(run_options, "monitor").classes("w-56").props(
-                        "unelevated spread"
-                    )
+                    ui.toggle(["监控", "轮询"], value=config.last_monitor_mode).bind_value(
+                        run_options, "monitor"
+                    ).classes("w-56").props("unelevated spread")
                 ui.number("轮询间隔（秒）", min=5, max=86400, step=5).bind_value(config, "poll_interval").classes("w-40")
                 ui.space()
 
                 async def handle_start():
                     try:
                         logger.info("用户点击启动：模式=%s，增量方式=%s", run_options["mode"], run_options["monitor"])
+                        config.last_run_mode = run_options["mode"]
+                        config.last_monitor_mode = run_options["monitor"]
                         validation_error = validate_config()
                         if validation_error:
                             logger.warning("启动失败：%s", validation_error)
@@ -691,99 +791,8 @@ def main_page():
                     finally:
                         ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
-                ui.button("▶ 启动", on_click=handle_start).classes("w-28 bg-green-600 text-white").props(
-                    "unelevated"
-                )
+                ui.button("▶ 启动", on_click=handle_start).classes("w-28 bg-green-600 text-white").props("unelevated")
                 ui.button("停止", on_click=handle_stop).classes("w-28 bg-slate-600 text-white").props("unelevated")
-        with ui.card().classes("w-full p-5 shadow-sm border-none bg-white"):
-            ui.label("⚙️ 系统与路径配置").classes("text-lg font-bold text-slate-700 mb-4")
-
-            with ui.expansion("🧠 小工具", icon="auto_awesome").classes("w-full mb-4"):
-                ui.input("新 STRM 示例链接").bind_value(example_new, "value").classes("w-full mb-3")
-                ui.input("旧 STRM 原始路径").bind_value(example_old, "value").classes("w-full mb-3")
-
-                def handle_infer_config():
-                    try:
-                        logger.info("用户点击识别并填充")
-                        logger.info("开始识别示例 STRM 配置")
-                        inferred = infer_config_from_examples(example_new["value"], example_old["value"])
-                        config.ms_url = inferred["ms_url"]
-                        config.ms_key = inferred["ms_key"]
-                        config.old_kw = inferred["old_kw"]
-                        config.new_pre = inferred["new_pre"]
-                        ui.notify(f"已识别并填充配置：{inferred['mode']}", type="positive")
-                        logger.info(
-                            "已识别配置：模式=%s，服务=%s，API Key=%s，旧路径关键字=%s，新路径前缀=%s",
-                            inferred["mode"],
-                            inferred["ms_url"],
-                            mask_secret(inferred["ms_key"]),
-                            inferred["old_kw"],
-                            inferred["new_pre"],
-                        )
-                    except ValueError as e:
-                        logger.warning("识别失败：%s", e)
-                        ui.notify(str(e), type="warning")
-                    finally:
-                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
-
-                ui.button("✨ 识别并填充", on_click=handle_infer_config).classes("bg-cyan-600 text-white").props(
-                    "unelevated"
-                )
-
-            with ui.row().classes("w-full gap-4 mb-4"):
-                ui.input("源目录（Docker 挂载）").bind_value(config, "src").classes("flex-1").props("disable")
-                ui.input("目标目录（Docker 挂载）").bind_value(config, "tgt").classes("flex-1").props("disable")
-
-            with ui.row().classes("w-full gap-4 mb-4"):
-                ui.input("旧路径关键字", validation={"不能为空": lambda v: len(v) > 0}).bind_value(
-                    config, "old_kw"
-                ).classes("flex-1")
-                ui.input("新路径前缀", validation={"不能为空": lambda v: len(v) > 0}).bind_value(
-                    config, "new_pre"
-                ).classes("flex-1")
-
-            with ui.row().classes("w-full gap-4 mb-4"):
-                ui.input("媒体服务地址").bind_value(config, "ms_url").classes("flex-1")
-                ui.input("API Key", password=True).bind_value(config, "ms_key").classes("flex-1")
-
-            with ui.row().classes("w-full gap-6 items-center"):
-                ui.checkbox("URL 编码").bind_value(config, "url_enc")
-                ui.checkbox("启用通知").bind_value(config, "notify")
-                ui.space()
-
-                def handle_save():
-                    try:
-                        logger.info("用户点击保存配置")
-                        if config.save():
-                            ui.notify("配置已保存", type="positive")
-                            logger.info("配置已保存：%s", CONFIG_FILE)
-                        else:
-                            logger.error("保存配置失败")
-                            ui.notify("保存失败，请检查配置目录权限", type="negative")
-                    finally:
-                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
-
-                def handle_test_notification():
-                    try:
-                        logger.info("用户点击测试通知")
-                        logger.info("开始测试通知")
-                        if not config.ms_url or not config.ms_key:
-                            logger.warning("测试通知失败：媒体服务地址或 API Key 为空")
-                            ui.notify("请先填写媒体服务地址和 API Key", type="warning")
-                            return
-                        if not is_valid_ms_url(config.ms_url):
-                            logger.warning("测试通知失败：媒体服务地址格式不正确")
-                            ui.notify("媒体服务地址必须以 http:// 或 https:// 开头", type="warning")
-                            return
-                        send_ms_notification("测试通知", "连接正常", True)
-                        ui.notify("测试通知已发送到队列", type="info")
-                    finally:
-                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
-
-                ui.button("🧪 测试通知", on_click=handle_test_notification).classes("bg-amber-500").props(
-                    "unelevated outline"
-                )
-                ui.button("💾 保存配置", on_click=handle_save).classes("bg-green-600 text-white").props("unelevated")
 
         with ui.expansion("📜 运行日志", icon="article").classes("w-full bg-white p-3 rounded shadow-sm"):
             with ui.row().classes("w-full items-center justify-between"):
@@ -823,5 +832,13 @@ def main_page():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    logger.info("服务启动完成，等待用户选择全量/增量后点击启动")
-    ui.run(title="StrmWatch Pro", host="0.0.0.0", port=8501, show=False, reload=False)
+    logger.info("启动完成")
+    ui.run(
+        title="StrmWatch",
+        host="0.0.0.0",
+        port=8501,
+        show=False,
+        reload=False,
+        show_welcome_message=False,
+        uvicorn_logging_level="error",
+    )
