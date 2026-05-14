@@ -259,24 +259,45 @@ def target_path_for_source(src_path: Path) -> Path:
     return Path(config.tgt).resolve() / rel_path
 
 
-def build_incremental_notification_content(converted: list[str], deleted: list[str]) -> str:
+def format_file_tree_item(path_text: str) -> list[str]:
+    parts = Path(path_text.replace("\\", "/")).parts
+    if len(parts) >= 2:
+        folder = str(Path(*parts[:-1])).replace("\\", "/")
+        filename = parts[-1]
+        return [f"--- 📁 {folder}", f"     └── {filename}"]
+    return [f"--- 📄 {path_text}"]
+
+
+def build_incremental_create_notification_content(converted: list[str]) -> str:
     lines = [
-        "STRM 增量处理完成",
-        f"转换/更新：{len(converted)}",
-        f"删除同步：{len(deleted)}",
+        "🔗 成功创建Strm文件",
     ]
-    if converted:
-        lines.append("")
-        lines.append("转换/更新文件：")
-        lines.extend(f"- {name}" for name in converted[:10])
-        if len(converted) > 10:
-            lines.append(f"- 其余 {len(converted) - 10} 个文件省略")
-    if deleted:
-        lines.append("")
-        lines.append("删除同步文件：")
-        lines.extend(f"- {name}" for name in deleted[:10])
-        if len(deleted) > 10:
-            lines.append(f"- 其余 {len(deleted) - 10} 个文件省略")
+    for name in converted[:10]:
+        lines.extend(format_file_tree_item(name))
+    if len(converted) > 10:
+        lines.append(f"--- 其余 {len(converted) - 10} 个文件省略")
+    return "\n".join(lines)
+
+
+def build_incremental_delete_notification_content(deleted: list[str]) -> str:
+    lines = [
+        "🗑️ 已同步删除Strm文件",
+    ]
+    for name in deleted[:10]:
+        lines.extend(format_file_tree_item(name))
+    if len(deleted) > 10:
+        lines.append(f"--- 其余 {len(deleted) - 10} 个文件省略")
+    return "\n".join(lines)
+
+
+def build_full_scan_notification_content(total: int, count: int) -> str:
+    lines = [
+        "📦 全量扫描完成",
+        f"--- 📂 源目录：{config.src}",
+        f"--- 📁 目标目录：{config.tgt}",
+        f"--- ✅ 生成数量：{count}",
+        f"--- 🔎 扫描数量：{total}",
+    ]
     return "\n".join(lines)
 
 
@@ -291,9 +312,11 @@ def flush_incremental_notification():
     if not converted and not deleted:
         return
 
-    content = build_incremental_notification_content(converted, deleted)
     logger.info("发送增量汇总通知：转换/更新=%s，删除=%s", len(converted), len(deleted))
-    send_ms_notification("STRM 增量处理通知", content)
+    if converted:
+        send_ms_notification("STRM 增量创建通知", build_incremental_create_notification_content(converted))
+    if deleted:
+        send_ms_notification("STRM 增量删除通知", build_incremental_delete_notification_content(deleted))
 
 
 def delayed_incremental_notification():
@@ -302,11 +325,15 @@ def delayed_incremental_notification():
 
 
 def record_incremental_change(action: str, src_path: Path):
+    try:
+        display_name = str(src_path.relative_to(Path(config.src).resolve())).replace("\\", "/")
+    except ValueError:
+        display_name = src_path.name
     with AppStatus.lock:
         if action == "deleted":
-            AppStatus.incremental_deleted.append(src_path.name)
+            AppStatus.incremental_deleted.append(display_name)
         else:
-            AppStatus.incremental_converted.append(src_path.name)
+            AppStatus.incremental_converted.append(display_name)
         if AppStatus.incremental_notify_timer is None or not AppStatus.incremental_notify_timer.is_alive():
             AppStatus.incremental_notify_timer = Thread(target=delayed_incremental_notification, daemon=True)
             AppStatus.incremental_notify_timer.start()
@@ -392,7 +419,7 @@ async def run_full_scan():
 
         logger.info("全量任务完成：扫描=%s，转换=%s", total, count)
         if count > 0:
-            send_ms_notification("全量扫描报告", f"已转换：{count}")
+            send_ms_notification("STRM 全量扫描通知", build_full_scan_notification_content(total, count))
     except Exception as e:
         logger.error("全量任务异常：%s", e)
 
