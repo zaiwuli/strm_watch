@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import os
+import sys
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -11,7 +12,7 @@ from threading import Event, Lock, Thread
 from typing import Dict, Generator, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from nicegui import ui
+from nicegui import app, ui
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -96,7 +97,7 @@ def setup_logging():
     logger_obj.handlers.clear()
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
-    stream_handler = logging.StreamHandler()
+    stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     logger_obj.addHandler(stream_handler)
 
@@ -107,6 +108,7 @@ def setup_logging():
 
 
 logger = setup_logging()
+logging.getLogger("nicegui").setLevel(logging.WARNING)
 
 
 def read_log_tail(max_chars: int = 60000) -> str:
@@ -130,6 +132,16 @@ def format_log_html(content: str) -> str:
         'font-size:12px; line-height:1.45;">'
         f"{newest_first}</pre>"
     )
+
+
+@app.get("/api/logs")
+def api_logs():
+    return {
+        "html": format_log_html(read_log_tail()),
+        "is_running": AppStatus.is_running,
+        "run_mode": AppStatus.run_mode,
+        "monitor_mode": AppStatus.monitor_mode,
+    }
 
 
 def is_valid_ms_url(value: str) -> bool:
@@ -605,35 +617,13 @@ def main_page():
     example_new = {"value": ""}
     example_old = {"value": ""}
     run_options = {"mode": "增量", "monitor": "监控"}
-    log_area = None
-    status_label = None
-    mode_label = None
-
-    def refresh_log():
-        if log_area is not None:
-            log_area.set_content(format_log_html(read_log_tail()))
-            log_area.update()
-
-    def refresh_status():
-        if status_label is not None:
-            status_label.set_text("🟢 运行中" if AppStatus.is_running else "🔴 未启动")
-            status_label.update()
-        if mode_label is not None:
-            mode_text = f"模式：{AppStatus.run_mode}"
-            if AppStatus.monitor_mode not in {"", "未启动"}:
-                mode_text += f" / {AppStatus.monitor_mode}"
-            mode_label.set_text(mode_text)
-            mode_label.update()
-
-    def refresh_ui_state():
-        refresh_status()
-        refresh_log()
-
     with ui.header().classes("items-center justify-between bg-slate-900 text-white shadow-md"):
         ui.label("📡 STRM 监控转换工具").classes("text-xl font-bold ml-4")
         with ui.row().classes("items-center mr-4 gap-3"):
-            status_label = ui.label("🟢 运行中" if AppStatus.is_running else "🔴 未启动").classes("text-base font-bold")
-            mode_label = ui.label(f"模式：{AppStatus.run_mode}").classes("text-sm text-slate-200")
+            ui.label("🟢 运行中" if AppStatus.is_running else "🔴 未启动").classes("text-base font-bold").props(
+                'id="status-label"'
+            )
+            ui.label(f"模式：{AppStatus.run_mode}").classes("text-sm text-slate-200").props('id="mode-label"')
 
     with ui.column().classes("w-full max-w-6xl mx-auto p-4 gap-4"):
         with ui.card().classes("w-full p-5 shadow-sm border-none bg-white"):
@@ -691,7 +681,7 @@ def main_page():
                         logger.exception("启动失败：%s", e)
                         ui.notify(f"启动失败：{e}", type="negative")
                     finally:
-                        refresh_ui_state()
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
                 def handle_stop():
                     try:
@@ -699,7 +689,7 @@ def main_page():
                         stop_runtime()
                         ui.notify("已停止", type="info")
                     finally:
-                        refresh_ui_state()
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
                 ui.button("▶ 启动", on_click=handle_start).classes("w-28 bg-green-600 text-white").props(
                     "unelevated"
@@ -734,7 +724,7 @@ def main_page():
                         logger.warning("识别失败：%s", e)
                         ui.notify(str(e), type="warning")
                     finally:
-                        refresh_ui_state()
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
                 ui.button("✨ 识别并填充", on_click=handle_infer_config).classes("bg-cyan-600 text-white").props(
                     "unelevated"
@@ -771,7 +761,7 @@ def main_page():
                             logger.error("保存配置失败")
                             ui.notify("保存失败，请检查配置目录权限", type="negative")
                     finally:
-                        refresh_ui_state()
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
                 def handle_test_notification():
                     try:
@@ -788,7 +778,7 @@ def main_page():
                         send_ms_notification("测试通知", "连接正常", True)
                         ui.notify("测试通知已发送到队列", type="info")
                     finally:
-                        refresh_ui_state()
+                        ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
 
                 ui.button("🧪 测试通知", on_click=handle_test_notification).classes("bg-amber-500").props(
                     "unelevated outline"
@@ -801,10 +791,35 @@ def main_page():
                 ui.label(f"日志文件：{LOG_FILE}").classes("text-xs text-slate-500")
             log_area = ui.html(format_log_html(read_log_tail())).classes(
                 "w-full h-[420px] overflow-auto bg-slate-950 text-lime-300 p-3 rounded mt-3"
-            )
+            ).props('id="log-panel"')
 
-            refresh_ui_state()
-            ui.timer(2.0, refresh_ui_state)
+            ui.add_body_html(
+                """
+                <script>
+                window.refreshStrmWatchUi = async function() {
+                  try {
+                    const response = await fetch('/api/logs', { cache: 'no-store' });
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    const logPanel = document.getElementById('log-panel');
+                    if (logPanel) logPanel.innerHTML = data.html;
+                    const statusLabel = document.getElementById('status-label');
+                    if (statusLabel) statusLabel.textContent = data.is_running ? '🟢 运行中' : '🔴 未启动';
+                    const modeLabel = document.getElementById('mode-label');
+                    if (modeLabel) {
+                      let text = `模式：${data.run_mode}`;
+                      if (data.monitor_mode && data.monitor_mode !== '未启动') text += ` / ${data.monitor_mode}`;
+                      modeLabel.textContent = text;
+                    }
+                  } catch (error) {
+                    console.debug('refreshStrmWatchUi failed', error);
+                  }
+                };
+                window.refreshStrmWatchUi();
+                setInterval(window.refreshStrmWatchUi, 2000);
+                </script>
+                """
+            )
 
 
 if __name__ in {"__main__", "__mp_main__"}:
