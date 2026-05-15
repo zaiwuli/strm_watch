@@ -1,11 +1,13 @@
-import asyncio
-import http.client
+﻿import asyncio
 import html
 import json
 import logging
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -19,6 +21,12 @@ from watchdog.observers import Observer
 
 CONFIG_FILE = Path(os.getenv("CONFIG_PATH", "/config/settings.json"))
 LOG_FILE = CONFIG_FILE.parent / "strm_watch.log"
+WEBHOOK_TEMPLATE_FILE = CONFIG_FILE.parent / "webhook_template.json"
+
+
+def normalize_tool_type(value: str) -> str:
+    value = (value or "MS").strip().upper()
+    return value if value in {"MS", "PSN"} else "MS"
 
 
 class GlobalConfig:
@@ -27,10 +35,11 @@ class GlobalConfig:
         self.tgt = os.getenv("TARGET_DIR", "/目标文件夹")
         self.old_kw = ""
         self.new_pre = "/"
+        self.tool_type = normalize_tool_type(os.getenv("TOOL_TYPE", "MS"))
         self.ms_url = ""
         self.ms_key = ""
         self.url_enc = True
-        self.notify = True
+        self.webhook_url = os.getenv("WEBHOOK_URL", "")
         self.poll_interval = 60
         self.last_run_mode = "增量"
         self.last_monitor_mode = "监控"
@@ -48,7 +57,7 @@ class GlobalConfig:
             self.ms_url = data.get("ms_url", self.ms_url)
             self.ms_key = data.get("ms_key", self.ms_key)
             self.url_enc = data.get("url_enc", self.url_enc)
-            self.notify = data.get("notify", self.notify)
+            self.webhook_url = data.get("webhook_url", self.webhook_url)
             self.poll_interval = int(data.get("poll_interval", self.poll_interval))
             self.last_run_mode = data.get("last_run_mode", self.last_run_mode)
             self.last_monitor_mode = data.get("last_monitor_mode", self.last_monitor_mode)
@@ -64,7 +73,7 @@ class GlobalConfig:
                 "ms_url": self.ms_url,
                 "ms_key": self.ms_key,
                 "url_enc": self.url_enc,
-                "notify": self.notify,
+                "webhook_url": self.webhook_url,
                 "poll_interval": self.poll_interval,
                 "last_run_mode": self.last_run_mode,
                 "last_monitor_mode": self.last_monitor_mode,
@@ -174,18 +183,18 @@ def common_suffix_length(left: list[str], right: list[str]) -> int:
     return count
 
 
-def infer_config_from_examples(new_strm_url: str, old_strm_path: str) -> Dict[str, str]:
+def infer_config_from_examples(new_strm_url: str, old_strm_path: str, tool_type: str = "MS") -> Dict[str, str]:
     parsed = urlparse(new_strm_url.strip())
     if not parsed.scheme or not parsed.netloc:
         raise ValueError("新 STRM 链接格式不正确")
 
     query = parse_qs(parsed.query)
-    api_key = query.get("apiKey", [""])[0]
+    api_key = query.get("apiKey", [""])[0] if tool_type == "MS" else ""
     encoded_new_path = query.get("path", [""])[0]
     new_path = unquote(encoded_new_path).strip()
     old_path = old_strm_path.strip()
 
-    if not api_key:
+    if tool_type == "MS" and not api_key:
         raise ValueError("新 STRM 链接里没有 apiKey 参数")
     if not new_path:
         raise ValueError("新 STRM 链接里没有 path 参数")
@@ -203,6 +212,7 @@ def infer_config_from_examples(new_strm_url: str, old_strm_path: str) -> Dict[st
             "old_kw": "/" + "/".join(old_parts[: media_index + 1]),
             "new_pre": "/" + "/".join(new_parts[:2]),
             "decoded_path": new_path,
+            "tool_type": tool_type,
             "mode": "媒体库映射",
         }
 
@@ -231,45 +241,156 @@ def infer_config_from_examples(new_strm_url: str, old_strm_path: str) -> Dict[st
         "old_kw": old_keyword,
         "new_pre": new_prefix,
         "decoded_path": new_path,
+        "tool_type": tool_type,
         "mode": mode,
     }
 
 
-def _do_send_ms(title: str, content: str):
-    conn = None
-    try:
-        if not is_valid_ms_url(config.ms_url):
-            logger.error("通知失败：媒体服务地址格式不正确")
-            return
-
-        parsed = urlparse(f"{config.ms_url.rstrip('/')}/api/v1/message/openSend")
-        payload = json.dumps({"title": title, "content": content})
-        headers = {"Content-Type": "application/json", "apiKey": config.ms_key}
-        conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
-        conn = conn_cls(parsed.netloc, timeout=5)
-        conn.request("POST", parsed.path, body=payload, headers=headers)
-        response = conn.getresponse()
-
-        if 200 <= response.status < 300:
-            logger.info("通知发送成功：%s", title)
-        else:
-            logger.error("通知发送失败：HTTP %s", response.status)
-    except Exception as e:
-        logger.error("通知发送失败：%s", e)
-    finally:
-        if conn:
-            conn.close()
+def find_first_strm_content(root: str) -> tuple[Path, str]:
+    root_path = Path(root)
+    if not root_path.exists():
+        raise ValueError(f"目录不存在：{root}")
+    for path in sorted(root_path.rglob("*.strm")):
+        if not path.is_file():
+            continue
+        if path.name.startswith("."):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            content = path.read_text(encoding="utf-8-sig", errors="replace").strip()
+        if content:
+            return path, content
+    raise ValueError(f"目录中没有可识别的 STRM 文件：{root}")
 
 
-def send_ms_notification(title: str, content: str, force: bool = False):
-    if not force and not config.notify:
-        logger.info("通知已跳过：通知开关未启用")
+def infer_config_from_mounted_dirs() -> Dict[str, str]:
+    old_path, old_content = find_first_strm_content(config.src)
+    new_path, new_content = find_first_strm_content(config.tgt)
+    logger.info("自动识别示例：旧 STRM=%s，新 STRM=%s", old_path, new_path)
+    return infer_config_from_examples(new_content, old_content, config.tool_type)
+
+
+def default_webhook_template() -> dict:
+    return {"method": "GET", "params": {"text": "{msg}"}}
+
+
+def ensure_webhook_template():
+    if WEBHOOK_TEMPLATE_FILE.exists():
         return
-    if not config.ms_url or not config.ms_key:
-        logger.warning("通知已跳过：媒体服务地址或 API Key 为空")
+    try:
+        WEBHOOK_TEMPLATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(WEBHOOK_TEMPLATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_webhook_template(), f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("创建 Webhook 模板失败：%s", e)
+
+
+def load_webhook_template() -> dict:
+    ensure_webhook_template()
+    try:
+        with open(WEBHOOK_TEMPLATE_FILE, "r", encoding="utf-8") as f:
+            template = json.load(f)
+        if not isinstance(template, dict):
+            raise ValueError("模板根节点必须是 JSON 对象")
+        return template
+    except Exception as e:
+        logger.error("读取 Webhook 模板失败，使用默认模板：%s", e)
+        return default_webhook_template()
+
+
+def _replace_webhook_placeholders(value, variables: dict[str, str]):
+    if isinstance(value, dict):
+        return {k: _replace_webhook_placeholders(v, variables) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_replace_webhook_placeholders(v, variables) for v in value]
+    if isinstance(value, str):
+        for key, replacement in variables.items():
+            value = value.replace("{" + key + "}", replacement)
+        return value
+    return value
+
+
+def _do_send_webhook(title: str, content: str):
+    webhook_url = config.webhook_url.strip()
+    if not webhook_url:
+        logger.info("通知跳过：未填写 Webhook URL")
+        return
+
+    now_text = time.strftime("%Y-%m-%d %H:%M:%S")
+    message = f"【{title}】\n{content}"
+    variables = {
+        "title": title,
+        "content": content,
+        "msg": message,
+        "tool": config.tool_type,
+        "time": now_text,
+    }
+    last_err = ""
+
+    for _ in range(3):
+        try:
+            if "@@TEXT@@" in webhook_url or "%40%40TEXT%40%40" in webhook_url:
+                safe_msg = urllib.parse.quote(message)
+                final_url = webhook_url.replace("%40%40TEXT%40%40", safe_msg).replace("@@TEXT@@", safe_msg)
+                req = urllib.request.Request(final_url, method="GET")
+            else:
+                template = load_webhook_template()
+                method = template.get("method", "GET").upper()
+                headers = _replace_webhook_placeholders(template.get("headers", {}), variables)
+                if not isinstance(headers, dict):
+                    headers = {}
+
+                target_url = _replace_webhook_placeholders(template.get("url", webhook_url), variables).strip()
+                if not target_url:
+                    target_url = webhook_url
+
+                if method == "POST" and "json_body" in template:
+                    body = _replace_webhook_placeholders(template["json_body"], variables)
+                    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                    headers["Content-Type"] = "application/json"
+                    req = urllib.request.Request(target_url, data=data, headers=headers, method="POST")
+                else:
+                    params_dict = _replace_webhook_placeholders(template.get("params", {}), variables)
+                    params = urllib.parse.urlencode(params_dict) if isinstance(params_dict, dict) else ""
+                    if method == "GET":
+                        parsed = list(urllib.parse.urlparse(target_url))
+                        if params:
+                            parsed[4] = params if not parsed[4] else parsed[4] + "&" + params
+                        req = urllib.request.Request(urllib.parse.urlunparse(parsed), method="GET", headers=headers)
+                    else:
+                        body = template.get("body", params_dict)
+                        body = _replace_webhook_placeholders(body, variables)
+                        if isinstance(body, (dict, list)):
+                            data = urllib.parse.urlencode(body).encode("utf-8")
+                        else:
+                            data = str(body).encode("utf-8")
+                        req = urllib.request.Request(
+                            target_url,
+                            data=data,
+                            headers=headers,
+                            method=method,
+                        )
+
+            with urllib.request.urlopen(req, timeout=30):
+                logger.info("Webhook 通知发送成功：%s", title)
+                return
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}: {e.reason}"
+            time.sleep(2)
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(2)
+
+    logger.error("Webhook 通知发送失败：%s", last_err)
+
+
+def send_webhook_notification(title: str, content: str, force: bool = False):
+    if not config.webhook_url.strip():
+        logger.info("通知跳过：未填写 Webhook URL")
         return
     logger.info("通知已加入发送队列：%s", title)
-    Thread(target=_do_send_ms, args=(title, content), daemon=True).start()
+    Thread(target=_do_send_webhook, args=(title, content), daemon=True).start()
 
 
 def target_path_for_source(src_path: Path) -> Path:
@@ -332,9 +453,9 @@ def flush_incremental_notification():
 
     logger.info("发送增量汇总通知：转换/更新=%s，删除=%s", len(converted), len(deleted))
     if converted:
-        send_ms_notification("STRM 增量创建通知", build_incremental_create_notification_content(converted))
+        send_webhook_notification("STRM 增量创建通知", build_incremental_create_notification_content(converted))
     if deleted:
-        send_ms_notification("STRM 增量删除通知", build_incremental_delete_notification_content(deleted))
+        send_webhook_notification("STRM 增量删除通知", build_incremental_delete_notification_content(deleted))
 
 
 def delayed_incremental_notification():
@@ -361,8 +482,11 @@ def record_incremental_change(action: str, src_path: Path):
 def process_file_logic(src_path: Path) -> bool:
     if src_path.suffix.lower() != ".strm" or not config.old_kw:
         return False
-    if not config.ms_url or not config.ms_key:
-        logger.warning("跳过处理：媒体服务地址或 API Key 为空")
+    if not config.ms_url:
+        logger.warning("跳过处理：服务地址为空")
+        return False
+    if config.tool_type == "MS" and not config.ms_key:
+        logger.warning("跳过处理：MS API Key 为空")
         return False
 
     try:
@@ -381,12 +505,17 @@ def process_file_logic(src_path: Path) -> bool:
         final_media_path = (config.new_pre.rstrip("/") + "/" + path_part).replace("\\", "/")
         if config.url_enc:
             final_media_path = quote(final_media_path, safe="/")
+        if config.tool_type == "PSN":
+            final_media_path = final_media_path.lstrip("/")
 
-        api_key = quote(config.ms_key, safe="")
-        new_content = (
-            f"{config.ms_url.rstrip('/')}/api/v1/cloudStorage/strm302"
-            f"?apiKey={api_key}&pickCode=&path={final_media_path}"
-        )
+        if config.tool_type == "PSN":
+            new_content = f"{config.ms_url.rstrip('/')}/my-server-api/api/getVideo302UrlByPath?path={final_media_path}"
+        else:
+            api_key = quote(config.ms_key, safe="")
+            new_content = (
+                f"{config.ms_url.rstrip('/')}/api/v1/cloudStorage/strm302"
+                f"?apiKey={api_key}&pickCode=&path={final_media_path}"
+            )
 
         tmp_path = target_path.with_name(f".{target_path.name}.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -437,7 +566,7 @@ async def run_full_scan():
 
         logger.info("全量任务完成：扫描=%s，转换=%s", total, count)
         if count > 0:
-            send_ms_notification("STRM 全量扫描通知", build_full_scan_notification_content(total, count))
+            send_webhook_notification("STRM 全量扫描通知", build_full_scan_notification_content(total, count))
     except Exception as e:
         logger.error("全量任务异常：%s", e)
 
@@ -445,10 +574,12 @@ async def run_full_scan():
 def validate_config() -> Optional[str]:
     if not config.old_kw or not config.new_pre:
         return "请填写旧路径关键字和新路径前缀"
-    if not config.ms_url or not config.ms_key:
-        return "请填写媒体服务地址和 API Key"
+    if not config.ms_url:
+        return "请填写服务地址"
+    if config.tool_type == "MS" and not config.ms_key:
+        return "MS 模式请填写 API Key"
     if not is_valid_ms_url(config.ms_url):
-        return "媒体服务地址必须以 http:// 或 https:// 开头"
+        return "服务地址必须以 http:// 或 https:// 开头"
     if not os.path.exists(config.src):
         return f"源目录不存在：{config.src}"
     return None
@@ -620,8 +751,6 @@ class WatchHandler(FileSystemEventHandler):
 @ui.page("/")
 def main_page():
     ui.query("body").style("background-color: #f8fafc")
-    example_new = {"value": ""}
-    example_old = {"value": ""}
     run_options = {"mode": config.last_run_mode, "monitor": config.last_monitor_mode}
     with ui.header().classes("items-center justify-between bg-slate-900 text-white shadow-md"):
         ui.label("📡 StrmWatch").classes("text-xl font-bold ml-4")
@@ -636,28 +765,26 @@ def main_page():
             ui.label("⚙️ 配置").classes("text-lg font-bold text-slate-700 mb-4")
 
             with ui.row().classes("w-full gap-4 mb-4"):
-                ui.input("源目录（Docker 挂载）").bind_value(config, "src").classes("flex-1").props("disable")
-                ui.input("目标目录（Docker 挂载）").bind_value(config, "tgt").classes("flex-1").props("disable")
+                ui.input("源目录").bind_value(config, "src").classes("flex-1").props("disable")
+                ui.input("目标目录").bind_value(config, "tgt").classes("flex-1").props("disable")
 
             with ui.expansion("小工具", icon="auto_awesome").classes("w-full mb-4"):
-                ui.input("新 STRM 示例链接").bind_value(example_new, "value").classes("w-full mb-3")
-                ui.input("旧 STRM 原始路径").bind_value(example_old, "value").classes("w-full mb-3")
-
                 def handle_infer_config():
                     try:
                         logger.info("用户点击识别并填充")
-                        logger.info("开始识别示例 STRM 配置")
-                        inferred = infer_config_from_examples(example_new["value"], example_old["value"])
+                        logger.info("开始从挂载目录识别 STRM 配置：工具=%s", config.tool_type)
+                        inferred = infer_config_from_mounted_dirs()
                         config.ms_url = inferred["ms_url"]
                         config.ms_key = inferred["ms_key"]
                         config.old_kw = inferred["old_kw"]
                         config.new_pre = inferred["new_pre"]
                         ui.notify(f"已识别并填充配置：{inferred['mode']}", type="positive")
                         logger.info(
-                            "已识别配置：模式=%s，服务=%s，API Key=%s，旧路径关键字=%s，新路径前缀=%s",
+                            "已识别配置：工具=%s，模式=%s，服务=%s，API Key=%s，旧路径关键字=%s，新路径前缀=%s",
+                            inferred["tool_type"],
                             inferred["mode"],
                             inferred["ms_url"],
-                            mask_secret(inferred["ms_key"]),
+                            mask_secret(inferred["ms_key"]) if inferred["ms_key"] else "无",
                             inferred["old_kw"],
                             inferred["new_pre"],
                         )
@@ -680,12 +807,21 @@ def main_page():
                 ).classes("flex-1")
 
             with ui.row().classes("w-full gap-4 mb-4"):
-                ui.input("媒体服务地址").bind_value(config, "ms_url").classes("flex-1")
-                ui.input("API Key", password=True).bind_value(config, "ms_key").classes("flex-1")
+                service_placeholder = "http://192.168.31.2:999" if config.tool_type == "PSN" else "https://ms.example.com:55123"
+                ui.input("服务地址").bind_value(config, "ms_url").classes("flex-1").props(f'placeholder="{service_placeholder}"')
+                if config.tool_type == "MS":
+                    ui.input("API Key", password=True).bind_value(config, "ms_key").classes("flex-1").props(
+                        'placeholder="仅 MS 需要"'
+                    )
+
+            with ui.column().classes("w-full gap-1 mb-4"):
+                ui.input("Webhook URL（留空则不发送通知）").bind_value(config, "webhook_url").classes("w-full")
+                ui.label(
+                    f"填写 Webhook 后自动通知；模板：{WEBHOOK_TEMPLATE_FILE}，变量：{{msg}}、{{title}}、{{content}}、{{tool}}、{{time}}"
+                ).classes("text-xs text-slate-500")
 
             with ui.row().classes("w-full gap-6 items-center"):
                 ui.checkbox("URL 编码").bind_value(config, "url_enc")
-                ui.checkbox("启用通知").bind_value(config, "notify")
                 ui.space()
 
                 def handle_save():
@@ -706,15 +842,11 @@ def main_page():
                     try:
                         logger.info("用户点击测试通知")
                         logger.info("开始测试通知")
-                        if not config.ms_url or not config.ms_key:
-                            logger.warning("测试通知失败：媒体服务地址或 API Key 为空")
-                            ui.notify("请先填写媒体服务地址和 API Key", type="warning")
+                        if not config.webhook_url.strip():
+                            logger.warning("测试通知失败：Webhook URL 为空")
+                            ui.notify("请先填写 Webhook URL", type="warning")
                             return
-                        if not is_valid_ms_url(config.ms_url):
-                            logger.warning("测试通知失败：媒体服务地址格式不正确")
-                            ui.notify("媒体服务地址必须以 http:// 或 https:// 开头", type="warning")
-                            return
-                        send_ms_notification("测试通知", "连接正常", True)
+                        send_webhook_notification("测试通知", "Webhook 连接正常", True)
                         ui.notify("测试通知已发送到队列", type="info")
                     finally:
                         ui.run_javascript("window.refreshStrmWatchUi && window.refreshStrmWatchUi()")
@@ -832,6 +964,7 @@ def main_page():
 
 
 if __name__ in {"__main__", "__mp_main__"}:
+    ensure_webhook_template()
     logger.info("启动完成")
     ui.run(
         title="StrmWatch",
